@@ -1,0 +1,5 @@
+SET name Nagesh
+DEL name
+SET name Nagesh
+SET name Romoe
+DEL name
