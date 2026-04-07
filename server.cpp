@@ -127,16 +127,16 @@ void handle_client (int client_socket){
     } else if(command == "GET"){
       lock_guard<mutex> lock(mtx);
       
-      //check for expiry
-      if(expiry.find(key) != expiry.end()){
-	if(chrono::steady_clock::now() > expiry[key]){
-	  store.erase(key);
-	  expiry.erase(key);
-	  response = "KEY NOT FOUND\n";
-	  send(client_socket, response.c_str(), response.size(), 0);
-	  continue;
-	}
-      }
+      // //check for expiry
+      // if(expiry.find(key) != expiry.end()){
+      // 	if(chrono::steady_clock::now() > expiry[key]){
+      // 	  store.erase(key);
+      // 	  expiry.erase(key);
+      // 	  response = "KEY NOT FOUND\n";
+      // 	  send(client_socket, response.c_str(), response.size(), 0);
+      // 	  continue;
+      // 	}
+      // }
       
       if(store.find(key) != store.end()){
 	response = store[key]+"\n";
