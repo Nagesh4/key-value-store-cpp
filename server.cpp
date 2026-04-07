@@ -18,6 +18,9 @@ void load_from_file();
 void parse_command(string &input, string &command, string &key, string &value);
 void cleanup_expired_keys();
 void worker_thread();
+void compact_file_background();
+long get_file_size();
+void auto_compaction_worker();
 
 unordered_map<string, string> store;
 unordered_map<string, chrono::steady_clock::time_point> expiry;
@@ -25,6 +28,8 @@ mutex mtx;
 queue<int> task_queue;
 mutex queue_mtx;
 condition_variable cv;
+bool is_compacting = false;
+const size_t FILE_THRESHOLD = 50;
 
 int main() {
   int server_fd, client_socket;
@@ -69,6 +74,8 @@ int main() {
   for(int i=0;i<THREAD_POOL_SIZE;i++){
     workers.emplace_back(worker_thread);
   }
+  thread compaction_thread(auto_compaction_worker);
+  compaction_thread.detach();
   
   while(true){
     client_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t *)&addrlen);
@@ -83,7 +90,6 @@ int main() {
     //client per thread
     // thread t (handle_client, client_socket);
     // t.detach();
-
     {
       lock_guard<mutex> lock(queue_mtx);
       task_queue.push(client_socket);
@@ -161,7 +167,17 @@ void handle_client (int client_socket){
       send(client_socket, response.c_str(), response.size(), 0);
       break;
       
-    } else{
+    } else if(command == "COMPACT"){
+      
+      if(!is_compacting){
+	thread t(compact_file_background);
+	t.detach();
+	response = "COMPACTION STARTED\n";
+      } else {
+	response = "COMPACTION ALREADY STARTED\n";
+      }
+      
+    }else{
       response = "INVALID COMMAND\n";
     }
     
@@ -248,5 +264,51 @@ void worker_thread(){
     }
     
     handle_client(client_socket);
+  }
+}
+
+void compact_file_background(){
+  unordered_map<string, string> snapshot;
+
+  {
+    lock_guard<mutex> lock(mtx);
+    snapshot = store;
+    is_compacting = true;
+  }
+
+  ofstream file("data_temp.txt");
+
+  for(auto &pair:snapshot){
+    file<<"SET "<<pair.first<<" "<<pair.second<<"\n";
+  }
+
+  file.close();
+
+  {
+    lock_guard<mutex> lock(mtx);
+    remove("data.txt");
+    rename("data_temp.txt", "data.txt");
+    is_compacting = false;
+  }
+
+  cout<<"Background  compaction done\n";
+  
+}
+
+long get_file_size(){
+  ifstream file("data.txt", ios::binary | ios::ate);
+  return file.tellg();
+}
+
+void auto_compaction_worker(){
+  while(true){
+    this_thread::sleep_for(chrono::seconds(30));
+
+    if(get_file_size() > FILE_THRESHOLD){
+      if(!is_compacting){
+	thread t(compact_file_background);
+	t.detach();
+      }
+    }
   }
 }

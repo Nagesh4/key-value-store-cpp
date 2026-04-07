@@ -74,7 +74,7 @@ int main(){
 	cout<<"Usage: EXPIRE key seconds\n";
 	continue;
       }
-    } else {
+    } else if (command != "COMPACT"){
       cout<<"Invalid command\n";
       continue;
     }
