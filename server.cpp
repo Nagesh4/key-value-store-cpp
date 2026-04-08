@@ -273,7 +273,6 @@ void compact_file_background(){
   {
     lock_guard<mutex> lock(mtx);
     snapshot = store;
-    is_compacting = true;
   }
 
   ofstream file("data_temp.txt");
@@ -297,6 +296,11 @@ void compact_file_background(){
 
 long get_file_size(){
   ifstream file("data.txt", ios::binary | ios::ate);
+
+  if(!file){
+    return 0; //file doesn't exist yet
+  }
+  
   return file.tellg();
 }
 
@@ -305,10 +309,21 @@ void auto_compaction_worker(){
     this_thread::sleep_for(chrono::seconds(30));
 
     if(get_file_size() > FILE_THRESHOLD){
-      if(!is_compacting){
+      bool should_start = false;
+
+      {
+	lock_guard<mutex> lock(mtx);
+	if(!is_compacting){
+	  is_compacting = true;
+	  should_start = true;
+	}
+      }
+
+      if(should_start){
 	thread t(compact_file_background);
 	t.detach();
       }
+
     }
   }
 }
