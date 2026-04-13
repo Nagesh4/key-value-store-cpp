@@ -13,7 +13,8 @@
 using namespace std;
 
 void handle_client(int client_socket);
-void append_to_file(const string &command_line);
+void append_to_file(const string &command, const string &key, const string &value);
+void append_to_file(const string &command, const string &key);
 void load_from_file();
 void parse_command(string &input, string &command, string &key, string &value);
 void cleanup_expired_keys();
@@ -21,6 +22,7 @@ void worker_thread();
 void compact_file_background();
 long get_file_size();
 void auto_compaction_worker();
+int recv_all(int sock, void* buff, int length);
 
 unordered_map<string, string> store;
 unordered_map<string, chrono::steady_clock::time_point> expiry;
@@ -30,6 +32,15 @@ mutex queue_mtx;
 condition_variable cv;
 bool is_compacting = false;
 const size_t FILE_THRESHOLD = 50;
+mutex file_mtx;
+
+enum Command{
+  CMD_SET = 1,
+  CMD_GET = 2,
+  CMD_DEL = 3,
+  CMD_EXPIRE = 4,
+  CMD_COMPACT = 5
+};
 
 int main() {
   int server_fd, client_socket;
@@ -86,15 +97,12 @@ int main() {
     }
 
     cout<<"New client connected"<<endl;
-
-    //client per thread
-    // thread t (handle_client, client_socket);
-    // t.detach();
+    
     {
       lock_guard<mutex> lock(queue_mtx);
       task_queue.push(client_socket);
     }
-
+    
     cv.notify_one();
   }
 
@@ -103,73 +111,130 @@ int main() {
 }
 
 void handle_client (int client_socket){
+  int key_len, val_len;
+  char key_buff[1024];
+  char value_buff[1024];
+  int seconds;
   char buffer[1024] = {0};
-
+  
   while(true){
-    
-    memset(buffer, 0, sizeof(buffer));
-    int bytes = read(client_socket, buffer, 1024);
+
+    int cmd = 0;
+    int bytes = recv_all(client_socket, &cmd, sizeof(cmd));
     
     if(bytes <= 0){
       cout<<"Client disconnected\n";
       break;
     }
-    
-    string input(buffer); //converted char in string
-    cout<<"Client says: "<<input<<endl;
-
-    string command, key, value;
-    parse_command(input, command, key, value);
-    
     string response;
     
-    if(command == "SET"){
-      lock_guard<mutex> lock(mtx);
-      store[key] = value;
+    if(cmd == CMD_SET){
+
+      recv_all(client_socket, &key_len, sizeof(key_len));
+
+      if(key_len > 1024){
+	response = "KEY TOO LARGE\n";
+	int n = send(client_socket, response.c_str(), response.size(), 0);
+
+	if(n<=0){
+	  cout<<"Client disconnect"<<endl;
+	}
+
+	continue;
+      }
+      
+      memset(key_buff, '\0', 1024);      
+      recv_all(client_socket, key_buff, key_len);
+      string key(key_buff, key_len);
+
+      recv_all(client_socket, &val_len, sizeof(val_len));
+      
+      if(val_len > 1024){
+	response = "KEY TOO LARGE\n";
+	int n = send(client_socket, response.c_str(), response.size(), 0);
+	
+	if(n<=0){
+	  cout<<"Client disconnect"<<endl;
+	}	
+	continue;
+      }
+      
+      memset(value_buff, '\0', 1024);
+      recv_all(client_socket, value_buff, val_len);
+
+      string value(value_buff, val_len);
+
+      {
+	lock_guard<mutex> lock(mtx);
+	store[key] = value;
+      }
+      
       response = "OK\n";
+      append_to_file("SET", key, value);
+      
+    } else if(cmd == CMD_GET){
 
-      append_to_file(input);
+      recv_all(client_socket, &key_len, sizeof(key_len));
       
-    } else if(command == "GET"){
-      lock_guard<mutex> lock(mtx);
+      memset(key_buff, '\0', 1024);
+
+      string key(key_len, '\0');
+      recv_all(client_socket, &key[0], key_len);
+
       
-      // //check for expiry
-      // if(expiry.find(key) != expiry.end()){
-      // 	if(chrono::steady_clock::now() > expiry[key]){
-      // 	  store.erase(key);
-      // 	  expiry.erase(key);
-      // 	  response = "KEY NOT FOUND\n";
-      // 	  send(client_socket, response.c_str(), response.size(), 0);
-      // 	  continue;
-      // 	}
-      // }
+      {
+	lock_guard<mutex> lock(mtx);
+	if(store.find(key) != store.end()){
+	  response = store[key]+"\n";
+	} else {
+	  response = "KEY NOT FOUND\n";
+	}
+      }      
+            
       
-      if(store.find(key) != store.end()){
-	response = store[key]+"\n";
-      } else {
-	response = "KEY NOT FOUND\n";
+    } else if(cmd == CMD_EXPIRE) {
+
+      recv_all(client_socket, &key_len, sizeof(key_len));
+
+      if(key_len > 1024){
+	response = "KEY TOO LARGE\n";
+	int n = send(client_socket, response.c_str(), response.size(), 0);
+
+	if(n<=0){
+	  cout<<"Client disconnect"<<endl;
+	}
+	
+	continue;
+      }
+	    
+      memset(key_buff, '\0', 1024);
+      recv_all(client_socket, key_buff, key_len);
+      string key(key_buff, key_len);
+      
+      recv_all(client_socket, &seconds, sizeof(seconds));
+
+      {
+	lock_guard<mutex> lock(mtx);
+	if(store.find(key) != store.end()){
+	  expiry[key] = chrono::steady_clock::now() + chrono::seconds(seconds);
+	  response = "OK\n";
+	} else {
+	  response = "KEY NOT FOUND\n";
+	}
       }
       
-    } else if(command == "EXPIRE"){
-      
-      int seconds = stoi(value);
-      lock_guard<mutex> lock(mtx);
+    } else if(cmd == CMD_COMPACT){
 
-      if(store.find(key) !=  store.end()){
-	expiry[key] = chrono::steady_clock::now() + chrono::seconds(seconds);
-	response = "OK\n";
-      } else {
-	response = "KEY NOT FOUND\n";
+      bool should_start = false;
+      {
+	lock_guard<mutex> lock(mtx);
+	if(!is_compacting){
+	  is_compacting = true;
+	  should_start = true;
+	}
       }
       
-    } else if(command == "EXIT"){
-      response = "Goodbye\n";
-      send(client_socket, response.c_str(), response.size(), 0);
-      break;
-      
-    } else if(command == "COMPACT"){
-      
-      if(!is_compacting){
+      if(should_start){
 	thread t(compact_file_background);
 	t.detach();
 	response = "COMPACTION STARTED\n";
@@ -177,20 +242,77 @@ void handle_client (int client_socket){
 	response = "COMPACTION ALREADY STARTED\n";
       }
       
-    }else{
+    } else if(cmd == CMD_DEL){
+      recv_all(client_socket, &key_len, sizeof(key_len));
+      
+      if(key_len > 1024){
+	response = "KEY TOO LARGE\n";
+	int n = send(client_socket, response.c_str(), response.size(), 0);
+	
+	if(n<=0){
+	  cout<<"Client disconnect"<<endl;
+	}
+	
+	continue;
+      }
+
+      memset(key_buff, '\0', 1024);
+      recv_all(client_socket, key_buff, key_len);
+
+      string key(key_buff, key_len);
+      
+      {
+	lock_guard<mutex> lock(mtx);
+	if(store.find(key) != store.end()){
+	  store.erase(key);
+	  expiry.erase(key);
+	  append_to_file("DEL",key);
+	  response = key+" has been deleted\n";
+	} else {
+	  response = key+" not found\n";
+	}
+      }
+      
+    } else{
       response = "INVALID COMMAND\n";
+      break;
     }
-    
-    send(client_socket, response.c_str(), response.size(), 0);
+
+    cout<<"Response: "<<response<<endl;
+    int n = send(client_socket, response.c_str(), response.size(), 0);
+
+    if(n<=0){
+      cout<<"Client disconnect"<<endl;
+    }
   }
   
   close(client_socket);
 }
 
-void append_to_file(const string &command_line){
+void append_to_file(const string &command, const string &key,
+		    const string &value){
 
+  lock_guard<mutex> lock(file_mtx);
   ofstream file("data.txt", ios::app);
-  file<<command_line<<"\n";
+  if(!file){
+    cout<<"Error in opening file\n";
+    return;
+  }
+  
+  file<<command<<" "<<key<<" "<<value<<"\n";
+  
+}
+
+void append_to_file(const string &command, const string &key){
+
+  lock_guard<mutex> lock(file_mtx);
+  ofstream file("data.txt", ios::app);
+  if(!file){
+    cout<<"Error in opening file\n";
+    return;
+  }
+  
+  file<<command<<" "<<key<<"\n";
   
 }
 
@@ -214,7 +336,7 @@ void load_from_file(){
     }
     
   }
-  
+
 }
 
 void parse_command(string &input, string &command, string &key, string &value){
@@ -243,7 +365,7 @@ void cleanup_expired_keys(){
 	store.erase(key);
 	it = expiry.erase(it);
 	
-	append_to_file("DEL "+key);
+	append_to_file("DEL",key);
 	cout<<"Expired key removed: "<<key<<endl;
       } else {
 	++it;
@@ -290,7 +412,7 @@ void compact_file_background(){
     is_compacting = false;
   }
 
-  cout<<"Background  compaction done\n";
+  cout<<"Background compaction done\n";
   
 }
 
@@ -308,7 +430,8 @@ void auto_compaction_worker(){
   while(true){
     this_thread::sleep_for(chrono::seconds(30));
 
-    if(get_file_size() > FILE_THRESHOLD){
+    int curr_file_size = get_file_size();
+    if(curr_file_size >= FILE_THRESHOLD){
       bool should_start = false;
 
       {
@@ -326,4 +449,24 @@ void auto_compaction_worker(){
 
     }
   }
+}
+
+int recv_all(int sock, void* buffer, int length){
+  int total = 0;
+
+  while(total < length){
+    int n = recv(sock, (char *) buffer + total, length-total, 0);
+
+    if(n == 0){
+      return 0;
+    }
+    
+    if (n < 0) {
+      perror("recv failed");
+      return -1;  
+    }
+    total += n;
+  }
+  
+  return total;
 }
